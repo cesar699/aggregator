@@ -253,8 +253,7 @@ def parse_link(link):
     d = fn(link)
     if d["type"] == "hy2":
         d["type"] = "hysteria2"
-    if not d.get("server") or not d.get("port"):
-        raise ValueError("missing server/port")
+    check_required(d)
     return d
 
 
@@ -282,8 +281,38 @@ def _ws_params(d):
     return p
 
 
+REQUIRED_FIELDS = {"vless": ("uuid",), "vmess": ("uuid",),
+                   "trojan": ("password",), "hysteria2": ("password",),
+                   "ss": ("cipher", "password")}
+
+
+def check_required(d):
+    """Required fields per protocol. A node missing one would make Mihomo
+    reject the whole config at startup (verified: 'key uuid missing'),
+    so drop it here and count it as dropped_bad instead."""
+    if not d.get("server"):
+        raise ValueError("missing server")
+    try:
+        port = int(d["port"])
+    except Exception:
+        raise ValueError("missing/invalid port")
+    if not 1 <= port <= 65535:
+        raise ValueError("port out of range")
+    for k in REQUIRED_FIELDS.get(d["type"], ()):
+        if not d.get(k):
+            raise ValueError(f"missing {k}")
+
+
 def build_vless(d):
-    p = {"encryption": "none", "security": "tls" if d.get("tls") else "none"}
+    if d.get("reality-opts"):
+        # Reality must stay reality: downgrading to plain TLS (the old
+        # behaviour) makes the client handshake against a Reality server
+        # and always fail.
+        ro = d["reality-opts"]
+        p = {"encryption": "none", "security": "reality",
+             "pbk": ro.get("public-key", ""), "sid": ro.get("short-id", "")}
+    else:
+        p = {"encryption": "none", "security": "tls" if d.get("tls") else "none"}
     p.update(_ws_params(d))
     if d.get("servername"):
         p["sni"] = d["servername"]
@@ -291,6 +320,8 @@ def build_vless(d):
         p["fp"] = d["client-fingerprint"]
     if d.get("flow"):
         p["flow"] = d["flow"]
+    if d.get("alpn"):
+        p["alpn"] = ",".join(d["alpn"]) if isinstance(d["alpn"], list) else d["alpn"]
     return ("vless://" + d["uuid"] + "@" + d["server"] + ":" + str(d["port"]) +
             "?" + urllib.parse.urlencode(p) + "#" + _enc_name(d["name"]))
 
@@ -366,6 +397,18 @@ def _sb_tls(d):
         tls["alpn"] = d["alpn"] if isinstance(d["alpn"], list) else [d["alpn"]]
     if d.get("client-fingerprint"):
         tls["utls"] = {"enabled": True, "fingerprint": d["client-fingerprint"]}
+    if d.get("reality-opts") and d["reality-opts"].get("public-key"):
+        # Without this, sing-box does plain TLS against a Reality server.
+        ro = d["reality-opts"]
+        reality = {"enabled": True, "public_key": ro["public-key"]}
+        if ro.get("short-id"):
+            reality["short_id"] = ro["short-id"]
+        tls["reality"] = reality
+        if "utls" not in tls:
+            # sing-box requires uTLS for Reality ("uTLS is required by
+            # reality client"); default to chrome when the source gives
+            # no fingerprint.
+            tls["utls"] = {"enabled": True, "fingerprint": "chrome"}
     return tls
 
 
@@ -390,8 +433,11 @@ def clash_to_singbox(d):
     if t == "vless":
         ob["type"] = "vless"
         ob["uuid"] = d["uuid"]
-        if d.get("flow"):
+        if d.get("flow") == "xtls-rprx-vision":
             ob["flow"] = d["flow"]
+        # sing-box supports only xtls-rprx-vision; mihomo-only flows like
+        # xtls-rprx-vision-udp443 make `sing-box check` reject the whole
+        # file, so they are dropped (the node still works as plain VLESS).
     elif t == "vmess":
         ob["type"] = "vmess"
         ob["uuid"] = d["uuid"]
@@ -400,6 +446,14 @@ def clash_to_singbox(d):
     elif t == "trojan":
         ob["type"] = "trojan"
         ob["password"] = d["password"]
+        # Explicit TLS (sing-box tolerates it missing, but be explicit).
+        tls = {"enabled": True}
+        sni = d.get("sni") or d.get("servername")
+        if sni:
+            tls["server_name"] = sni
+        if d.get("skip-cert-verify"):
+            tls["insecure"] = True
+        ob["tls"] = tls
     elif t == "ss":
         ob["type"] = "shadowsocks"
         ob["method"] = d["cipher"]
@@ -407,6 +461,16 @@ def clash_to_singbox(d):
     elif t == "hysteria2":
         ob["type"] = "hysteria2"
         ob["password"] = d["password"]
+        # sing-box REQUIRES tls for hysteria2 ("TLS required" without it);
+        # Clash hy2 dicts never carry a tls key, so build it here.
+        tls = {"enabled": True}
+        sni = d.get("sni") or d.get("servername")
+        if sni:
+            tls["server_name"] = sni
+        if d.get("skip-cert-verify"):
+            tls["insecure"] = True
+        tls["alpn"] = d["alpn"] if isinstance(d.get("alpn"), list) and d["alpn"] else ["h3"]
+        ob["tls"] = tls
         if d.get("obfs"):
             ob["obfs"] = {"type": d["obfs"]}
             if d.get("obfs-password"):
@@ -466,6 +530,7 @@ def normalise_clash_dict(p):
     if d.get("sni") and not d.get("servername"):
         d["servername"] = d["sni"]
     d["port"] = int(d["port"])
+    check_required(d)
     d.setdefault("name", f"{t}-{d['server']}:{d['port']}")
     return d
 
@@ -735,7 +800,10 @@ class PurityChecker:
         if r is None:
             return "unknown"
         body = r.text.lower()
-        if r.status_code == 200 and ("/title/" in r.url or "watch" in body):
+        # "yes" only when we actually land on the title page. The old
+        # check also accepted "watch" anywhere in the body, which appears
+        # in Netflix nav/footer even on region-block pages (false "yes").
+        if r.status_code == 200 and "/title/" in r.url:
             return "yes"
         if r.status_code in (403, 404) or "not available" in body or "nses-" in body:
             return "no"
@@ -842,7 +910,9 @@ def build_outputs(proxies_sorted, nodes, out_dir, cfg, source_reports, counts, g
             log(f"sing-box build skipped for {p['name']}: {e}")
     outbounds.append({"type": "selector", "tag": "PROXY",
                       "outbounds": names, "default": names[0] if names else ""})
-    singbox = {"version": 2, "outbounds": outbounds,
+    # NOTE: sing-box has no top-level "version" field; adding one makes
+    # `sing-box check` reject the whole file ("unknown field version").
+    singbox = {"outbounds": outbounds,
                "route": {"final": "PROXY"}}
     (out_dir / "singbox.json").write_text(
         json.dumps(singbox, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -866,8 +936,13 @@ def gist_update(out_dir, cfg):
     token = os.environ.get("GIST_PAT") or os.environ.get("PUSH_TOKEN")
     gist_id = os.environ.get("GIST_ID")
     if not token or not gist_id:
-        log("GIST SKIP: GIST_PAT/PUSH_TOKEN or GIST_ID not set; outputs kept locally")
-        return 0
+        if os.environ.get("AGGREGATOR_LOCAL_TEST"):
+            log("GIST SKIP (local test mode): GIST_PAT/PUSH_TOKEN or GIST_ID not set; outputs kept locally")
+            return 0
+        # Fail closed: silently "succeeding" while publishing nothing hides
+        # a broken setup and never trips the consecutive-failure alert.
+        log("GIST FAIL: GIST_PAT/PUSH_TOKEN or GIST_ID not set")
+        return 4
     out_dir = Path(out_dir)
     report = json.loads((out_dir / "report.json").read_text(encoding="utf-8"))
     kept = report["counts"]["kept"]
@@ -943,8 +1018,10 @@ def main():
 
     kept, nodes = [], []
     dropped_no_exit = 0
+    alive_count = 0
     if args.skip_mihomo:
         kept = [(p, None) for p in deduped]
+        alive_count = len(deduped)
         log("SKIP-MIHOMO: treating deduped nodes as kept (latency null)")
     else:
         import tempfile
@@ -953,6 +1030,7 @@ def main():
                 m.start(deduped)
                 alive = liveness_test(m, deduped, cfg)
                 log(f"liveness: alive={len(alive)} / {len(deduped)}")
+                alive_count = len(alive)
                 kept = alive[: cfg["max_keep"]]
                 if not kept:
                     log("FATAL: no alive nodes after liveness test")
@@ -990,7 +1068,7 @@ def main():
     nodes = [node_by_name[p["name"]] for p, _ in kept]
 
     counts = {"raw": counters["raw"], "deduped": len(deduped),
-              "alive": len(kept) if not args.skip_mihomo else len(deduped),
+              "alive": alive_count,
               "kept": len(kept), "dropped_no_exit_ip": dropped_no_exit,
               "dropped_ssr": counters["dropped_ssr"]}
     gate = {"prev_kept": None, "min_required": cfg["min_keep"], "passed": None}
@@ -1000,7 +1078,11 @@ def main():
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
         import validate as _v
-        if _v.validate_dir(Path(args.out)) != 0:
+        mihomo_bin = os.environ.get("MIHOMO_BIN") or str(REPO_ROOT / "clash" / "clash-linux-amd")
+        singbox_bin = os.environ.get("SINGBOX_BIN")
+        if _v.validate_dir(Path(args.out),
+                           mihomo_bin if Path(mihomo_bin).exists() else None,
+                           singbox_bin if singbox_bin and Path(singbox_bin).exists() else None) != 0:
             return 5
     except ImportError:
         log("validate.py not importable; skipping internal validation")
