@@ -5,6 +5,13 @@ on:
     - cron: "0 */6 * * *"
   workflow_dispatch:
 
+# The failure-alert step creates issues; without this the default token
+# may not have issues:write and the alert silently never fires.
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
 concurrency:
   group: free-nodes
   cancel-in-progress: false
@@ -38,8 +45,14 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
         run: python free-nodes/run.py --out out
 
+      - name: Download sing-box
+        run: |
+          curl -sL -o /tmp/sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          /tmp/sing-box-1.14.3-linux-amd64/sing-box version
+
       - name: Validate outputs
-        run: python free-nodes/validate.py --dir out
+        run: python free-nodes/validate.py --dir out --mihomo-bin clash/clash-linux-amd --singbox-bin /tmp/sing-box-1.14.3-linux-amd64/sing-box
 
       - name: Upload outputs artifact
         if: always()
@@ -59,6 +72,12 @@ jobs:
           echo "Last 2 completed conclusions: $RUNS_JSON"
           PREV=$(echo "$RUNS_JSON" | python3 -c "import json,sys; r=json.load(sys.stdin); print(r[0] if len(r)>0 else 'none')")
           if [ "$PREV" = "failure" ]; then
+            # Don't spam a new issue for every further failure.
+            OPEN=$(gh api "repos/${{ github.repository }}/issues?state=open&per_page=100" --jq '[.[] | select(.title=="free-nodes 连续失败 2 次，请检查")] | length')
+            if [ "$OPEN" != "0" ]; then
+              echo "An open alert issue already exists; skipping."
+              exit 0
+            fi
             gh api "repos/${{ github.repository }}/issues" \
               -f title="free-nodes 连续失败 2 次，请检查" \
               -f body="Free Nodes 工作流连续失败 2 次。
