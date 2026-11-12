@@ -14,7 +14,9 @@ Checks (first problem found exits non-zero):
 import argparse
 import base64
 import json
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 KNOWN_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")
@@ -25,7 +27,36 @@ def fail(msg):
     return 1
 
 
-def validate_dir(out_dir: Path) -> int:
+def check_mihomo(clash_path: Path, mihomo_bin: str) -> int:
+    """Run `mihomo -t` on the generated clash.yaml. NOTE: mihomo -t exits
+    0 even when the test fails, so grep the output for the success line."""
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            r = subprocess.run([mihomo_bin, "-d", td, "-f", str(clash_path), "-t"],
+                               capture_output=True, text=True, timeout=120)
+        except Exception as e:
+            return fail(f"mihomo -t could not run: {e}")
+    out = (r.stdout or "") + (r.stderr or "")
+    if "test is successful" in out:
+        print("MIHOMO CHECK OK: clash.yaml accepted by mihomo -t")
+        return 0
+    return fail(f"mihomo -t rejected clash.yaml: {out[-500:]!r}")
+
+
+def check_singbox(singbox_path: Path, singbox_bin: str) -> int:
+    try:
+        r = subprocess.run([singbox_bin, "check", "-c", str(singbox_path)],
+                           capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        return fail(f"sing-box check could not run: {e}")
+    if r.returncode == 0:
+        print("SING-BOX CHECK OK: singbox.json accepted by sing-box check")
+        return 0
+    out = (r.stdout or "") + (r.stderr or "")
+    return fail(f"sing-box check rejected singbox.json: {out[-500:]!r}")
+
+
+def validate_dir(out_dir: Path, mihomo_bin=None, singbox_bin=None) -> int:
     import yaml  # local import so --help works without deps
 
     clash_path = out_dir / "clash.yaml"
@@ -96,18 +127,31 @@ def validate_dir(out_dir: Path) -> int:
         f"singbox={len(outbounds)} outbounds, v2ray={len(lines)} links, "
         f"report kept={kept}"
     )
+
+    # Deep checks against the real parsers (plain YAML/JSON parsing alone
+    # missed the illegal "version" field and the hy2-missing-TLS bug).
+    if mihomo_bin:
+        rc = check_mihomo(clash_path, mihomo_bin)
+        if rc != 0:
+            return rc
+    if singbox_bin:
+        rc = check_singbox(singbox_path, singbox_bin)
+        if rc != 0:
+            return rc
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Validate free-nodes outputs")
     ap.add_argument("--dir", default=None, help="output directory (default: <repo>/out)")
+    ap.add_argument("--mihomo-bin", default=None, help="path to mihomo binary for -t check")
+    ap.add_argument("--singbox-bin", default=None, help="path to sing-box binary for check")
     args = ap.parse_args()
     if args.dir:
         out_dir = Path(args.dir)
     else:
         out_dir = Path(__file__).resolve().parent.parent / "out"
-    return validate_dir(out_dir)
+    return validate_dir(out_dir, args.mihomo_bin, args.singbox_bin)
 
 
 if __name__ == "__main__":
