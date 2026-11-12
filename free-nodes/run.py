@@ -62,6 +62,16 @@ def q(name):
     return urllib.parse.quote(str(name), safe="")
 
 
+def _alpn_list(v):
+    """Mihomo requires alpn to be a list; sources often give 'h2' or
+    'h2,http/1.1' as a plain string."""
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    if isinstance(v, str):
+        return [x.strip() for x in v.split(",") if x.strip()]
+    return []
+
+
 def load_config():
     with open(CONFIG_PATH, encoding="utf-8") as f:
         return json.load(f)
@@ -127,7 +137,7 @@ def parse_vless(link):
     if params.get("flow"):
         d["flow"] = params["flow"][0]
     if params.get("alpn"):
-        d["alpn"] = params["alpn"][0]
+        d["alpn"] = _alpn_list(params["alpn"][0])
     if params.get("allowInsecure", ["0"])[0] in ("1", "true"):
         d["skip-cert-verify"] = True
     _ws_opts(d, params)
@@ -221,7 +231,7 @@ def parse_hysteria2(link):
     if params.get("obfs-password"):
         d["obfs-password"] = params["obfs-password"][0]
     if params.get("alpn"):
-        d["alpn"] = params["alpn"][0]
+        d["alpn"] = _alpn_list(params["alpn"][0])
     return d
 
 
@@ -420,7 +430,10 @@ def fetch_source(url, timeout=30):
             r = requests.get(url, timeout=timeout,
                              headers={"User-Agent": "cesar699-aggregator/1.0"})
             r.raise_for_status()
-            return r.text
+            # Decode as UTF-8 explicitly: requests defaults to latin-1 when
+            # the server sends no charset, which turns flag emoji bytes into
+            # U+009F control chars that break YAML parsing downstream.
+            return r.content.decode("utf-8", errors="replace")
         except Exception as e:
             last = e
             time.sleep(2)
@@ -446,6 +459,8 @@ def normalise_clash_dict(p):
     if t == "hy2":
         t = "hysteria2"
     d["type"] = t
+    if d.get("alpn") is not None:
+        d["alpn"] = _alpn_list(d["alpn"])
     if d.get("servername") and not d.get("sni") and t in ("trojan", "hysteria2"):
         d["sni"] = d["servername"]
     if d.get("sni") and not d.get("servername"):
@@ -480,6 +495,9 @@ def collect_sources(cfg, sources_file=None):
         got = []
         try:
             if kind == "clash":
+                # Strip stray control chars (belt & braces for mis-decoded
+                # sources) before YAML parsing.
+                text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
                 data = yaml.safe_load(text) or {}
                 for p in data.get("proxies") or []:
                     if not isinstance(p, dict):
@@ -577,16 +595,29 @@ class Mihomo:
         return False
 
     def start(self, proxies):
+        if not proxies:
+            raise RuntimeError("no proxies to start mihomo with")
         self.stop()
         cfg_path = self.workdir / "mihomo.yaml"
         write_mihomo_config(cfg_path, proxies)
+        self.log_path = self.workdir / "mihomo.log"
+        self.log_file = open(self.log_path, "w", encoding="utf-8")
         self.proc = subprocess.Popen(
             [MIHOMO_BIN, "-d", str(self.workdir), "-f", str(cfg_path)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=self.log_file, stderr=subprocess.STDOUT)
         deadline = time.time() + 30
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                raise RuntimeError(f"mihomo exited early rc={self.proc.returncode}")
+                self.log_file.flush()
+                tail = ""
+                try:
+                    tail = self.log_path.read_text(
+                        encoding="utf-8", errors="replace")[-1000:]
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"mihomo exited early rc={self.proc.returncode}: "
+                    f"{tail.strip()}")
             try:
                 r = requests.get(CONTROLLER + "/version", timeout=2)
                 if r.status_code == 200:
@@ -607,6 +638,12 @@ class Mihomo:
                 except Exception:
                     pass
             self.proc = None
+        if getattr(self, "log_file", None) is not None:
+            try:
+                self.log_file.close()
+            except Exception:
+                pass
+            self.log_file = None
 
     def delay(self, name, url, timeout_ms):
         r = requests.get(f"{CONTROLLER}/proxies/{q(name)}/delay",
@@ -917,6 +954,9 @@ def main():
                 alive = liveness_test(m, deduped, cfg)
                 log(f"liveness: alive={len(alive)} / {len(deduped)}")
                 kept = alive[: cfg["max_keep"]]
+                if not kept:
+                    log("FATAL: no alive nodes after liveness test")
+                    return 3
                 if args.skip_purity:
                     nodes = [{"name": p["name"], "protocol": p["type"],
                               "server": p["server"], "port": int(p["port"]),
