@@ -1,0 +1,72 @@
+name: Free Nodes
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: free-nodes
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pyyaml requests
+
+      - name: Make Mihomo executable
+        run: chmod +x clash/clash-linux-amd
+
+      - name: Run aggregation pipeline
+        env:
+          GIST_PAT: ${{ secrets.GIST_PAT }}
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: python free-nodes/run.py --out out
+
+      - name: Validate outputs
+        run: python free-nodes/validate.py --dir out
+
+      - name: Upload outputs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: free-nodes-out
+          path: out/
+          retention-days: 7
+
+      - name: Alert on 2 consecutive failures
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          RUNS_JSON=$(gh api "repos/${{ github.repository }}/actions/workflows/free-nodes.yaml/runs?per_page=2&status=completed" --jq '.workflow_runs | map(.conclusion)')
+          echo "Last 2 completed conclusions: $RUNS_JSON"
+          PREV=$(echo "$RUNS_JSON" | python3 -c "import json,sys; r=json.load(sys.stdin); print(r[0] if len(r)>0 else 'none')")
+          if [ "$PREV" = "failure" ]; then
+            gh api "repos/${{ github.repository }}/issues" \
+              -f title="free-nodes 连续失败 2 次，请检查" \
+              -f body="Free Nodes 工作流连续失败 2 次。
+
+          - 仓库: ${{ github.repository }}
+          - 本次运行: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          - 时间: $(date -u '+%Y-%m-%d %H:%M UTC')（Asia/Shanghai 约 $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')）
+          - 说明：Gist 未更新，订阅仍为上一次成功的结果。请检查 Actions 日志（节点源、Mihomo 检测或纯净度探测可能出了问题）。"
+          else
+            echo "Previous run did not fail (prev=$PREV); no issue created."
+          fi
