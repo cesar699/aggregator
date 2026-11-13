@@ -20,6 +20,8 @@ Token 只能放在仓库 Secrets，不能写进代码、README、提交记录或
 
 `blacklist_flag` 是出口 IP 是否精确命中 [blocklist.de 的 all.txt 名单](https://lists.blocklist.de/lists/all.txt)。官方说明该名单列出过去 48 小时向其或合作方报告的攻击 IP，并每 30 分钟生成；因此“未命中”仅表示未出现在这份近期名单中，不代表全网或所有威胁情报库都判定干净。该结果与 IPQuery 的 proxy/VPN/Tor 分类分开报告，不会因命中而自动删掉节点。
 
+如果该次名单快照没有覆盖某个出口 IP 版本（例如快照只有 IPv4，而节点出口为 IPv6），对应节点仍可保留，但 `blacklist_status` 会是 `ip_version_not_covered`、`blacklist_flag` 为 `null`；这是“未知”，不是“未命中”。
+
 最后按两个测速中较高的延迟排序，最多保留 200 个节点。发布前必须通过 Clash YAML 解析、V2Ray Base64 解码和每条分享链接解析、Sing-box JSON 解析、Mihomo 配置检查与 `sing-box check`。少于 20 个节点，或低于上次保留数的一半（向上取整），旧结果都会保留；旧报告读不到、检查数据缺失或任一验证失败也不会更新。连续失败两次会在 Fork 仓库创建一条 Issue 提醒。
 
 ## 订阅地址

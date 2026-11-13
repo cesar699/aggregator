@@ -14,7 +14,7 @@
 | V2Ray | `https://gist.githubusercontent.com/cesar699/24c6aea70f95c6f67a5cc66515e90081/raw/v2ray.txt` |
 | Sing-box | `https://gist.githubusercontent.com/cesar699/24c6aea70f95c6f67a5cc66515e90081/raw/singbox.json` |
 
-纯净度报告（出口国家 / ASN / 机房、移动或推测住宅 / 代理风险 / 黑名单命中 / Netflix、ChatGPT 解锁）：`https://gist.githubusercontent.com/cesar699/24c6aea70f95c6f67a5cc66515e90081/raw/report.json`。代理/VPN/Tor 分类和风险分数来自 IPQuery；独立 `blacklist_flag` 是对 [blocklist.de 公开名单](https://www.blocklist.de/en/export.html) 的精确 IP 匹配（该名单记录过去 48 小时报告的攻击 IP），不是覆盖所有威胁情报的“绝对干净”结论。
+纯净度报告（出口国家 / ASN / 机房、移动或推测住宅 / 代理风险 / 黑名单命中 / Netflix、ChatGPT 解锁）：`https://gist.githubusercontent.com/cesar699/24c6aea70f95c6f67a5cc66515e90081/raw/report.json`。代理/VPN/Tor 分类和风险分数来自 IPQuery；独立 `blacklist_flag` 是对 [blocklist.de 公开名单](https://www.blocklist.de/en/export.html) 的精确 IP 匹配（该名单记录过去 48 小时报告的攻击 IP），不是覆盖所有威胁情报的“绝对干净”结论。若名单快照未覆盖某个出口 IP 版本，报告会标为 `ip_version_not_covered`，不会把未知误写成“未命中”。
 
 ## 一键导入 Shadowrocket
 

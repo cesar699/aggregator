@@ -265,6 +265,23 @@ def _enc_name(name):
     return urllib.parse.quote(str(name), safe="")
 
 
+def _uri_hostport(host, port):
+    """Format an address for URI authority syntax, bracketing IPv6 literals."""
+    host = str(host).strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    if ":" in host:
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError as e:
+            raise ValueError(f"invalid IP literal in server address: {host!r}") from e
+        if address.version == 6:
+            host = f"[{address.compressed}]"
+        else:
+            host = address.compressed
+    return f"{host}:{int(port)}"
+
+
 def _ws_params(d):
     p = {}
     net = d.get("network", "tcp")
@@ -345,7 +362,7 @@ def build_vless(d):
         p["flow"] = d["flow"]
     if d.get("alpn"):
         p["alpn"] = ",".join(d["alpn"]) if isinstance(d["alpn"], list) else d["alpn"]
-    return ("vless://" + d["uuid"] + "@" + d["server"] + ":" + str(d["port"]) +
+    return ("vless://" + d["uuid"] + "@" + _uri_hostport(d["server"], d["port"]) +
             "?" + urllib.parse.urlencode(p) + "#" + _enc_name(d["name"]))
 
 
@@ -370,12 +387,12 @@ def build_trojan(d):
         p["allowInsecure"] = "1"
     qs = ("?" + urllib.parse.urlencode(p)) if p else ""
     return ("trojan://" + urllib.parse.quote(d["password"], safe="") + "@" +
-            d["server"] + ":" + str(d["port"]) + qs + "#" + _enc_name(d["name"]))
+            _uri_hostport(d["server"], d["port"]) + qs + "#" + _enc_name(d["name"]))
 
 
 def build_ss(d):
     user = b64encode_nopad((d["cipher"] + ":" + d["password"]).encode())
-    return ("ss://" + user + "@" + d["server"] + ":" + str(d["port"]) +
+    return ("ss://" + user + "@" + _uri_hostport(d["server"], d["port"]) +
             "#" + _enc_name(d["name"]))
 
 
@@ -391,7 +408,7 @@ def build_hysteria2(d):
         p["obfs-password"] = d["obfs-password"]
     qs = ("?" + urllib.parse.urlencode(p)) if p else ""
     return ("hysteria2://" + urllib.parse.quote(d["password"], safe="") + "@" +
-            d["server"] + ":" + str(d["port"]) + qs + "#" + _enc_name(d["name"]))
+            _uri_hostport(d["server"], d["port"]) + qs + "#" + _enc_name(d["name"]))
 
 
 LINK_BUILDERS = {"vless": build_vless, "vmess": build_vmess, "trojan": build_trojan,

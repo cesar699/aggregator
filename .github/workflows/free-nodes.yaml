@@ -35,6 +35,9 @@ jobs:
       - name: Install dependencies
         run: pip install pyyaml requests
 
+      - name: Run offline regression tests
+        run: python -m unittest discover -s free-nodes -p 'test_*.py' -v
+
       - name: Make Mihomo executable
         run: chmod +x clash/clash-linux-amd
 

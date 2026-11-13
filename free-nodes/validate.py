@@ -173,16 +173,19 @@ def validate_dir(out_dir: Path, mihomo_bin=None, singbox_bin=None) -> int:
             return fail(f"report node #{i} has an invalid exit IP")
         if not address.is_global:
             return fail(f"report node #{i} exit IP is not public")
-        if address.version not in ip_versions:
-            return fail(f"blacklist snapshot does not cover report node #{i} IP version")
-        for field in ("proxy_flag", "vpn_flag", "tor_flag", "public_risk_flag", "blacklist_flag"):
+        for field in ("proxy_flag", "vpn_flag", "tor_flag", "public_risk_flag"):
             if type(node.get(field)) is not bool:
                 return fail(f"report node #{i} field {field} is not a boolean result")
         if not isinstance(node.get("risk_score"), int) or isinstance(node["risk_score"], bool) or not 0 <= node["risk_score"] <= 100:
             return fail(f"report node #{i} has an invalid IPQuery risk_score")
-        expected_status = "match" if node["blacklist_flag"] else "no_match"
-        if node["blacklist_status"] != expected_status:
-            return fail(f"report node #{i} blacklist flag/status disagree")
+        if address.version in ip_versions:
+            if type(node.get("blacklist_flag")) is not bool:
+                return fail(f"report node #{i} blacklist flag is not a boolean for a covered IP version")
+            expected_status = "match" if node["blacklist_flag"] else "no_match"
+            if node["blacklist_status"] != expected_status:
+                return fail(f"report node #{i} blacklist flag/status disagree")
+        elif node.get("blacklist_flag") is not None or node.get("blacklist_status") != "ip_version_not_covered":
+            return fail(f"report node #{i} must mark blacklist status unknown when its IP version is not covered")
         if node["blacklist_source"] != blacklist.get("name") or node["blacklist_checked_at"] != blacklist["checked_at"]:
             return fail(f"report node #{i} blacklist metadata does not match the checked snapshot")
         if node.get("network_type") not in ("datacenter", "mobile", "likely-residential", "unknown"):
