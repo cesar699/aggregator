@@ -1,0 +1,24 @@
+# Serve the published subscriptions from this server.
+#
+# DOMAIN is read from free-nodes/.env (see .env.example):
+#   DOMAIN=sub.example.com      -> automatic HTTPS on ports 80/443
+#   DOMAIN=http://1.2.3.4:8080  -> plain HTTP, testing only, no TLS
+#
+# The web service only reads free-nodes/data/published (read-only mount).
+# Until the first successful aggregate run there is nothing to serve yet
+# and requests return 404, which is expected.
+
+{$DOMAIN}
+
+@health path /healthz
+handle @health {
+	respond "ok" 200
+}
+
+handle {
+	root * /srv
+	# Subscriptions change every 6 hours; clients must always re-fetch.
+	header Cache-Control "no-cache, no-store, must-revalidate"
+	header X-Content-Type-Options "nosniff"
+	file_server
+}

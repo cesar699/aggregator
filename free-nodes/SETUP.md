@@ -12,9 +12,21 @@
 
 ## 服务器自托管（Docker）
 
-该模式把结果写进服务器本地目录，不需要 `GIST_ID` 或 GitHub Token。Compose 默认不开放任何网络端口；如果要让 Clash、Shadowrocket 等客户端从外部拉取订阅，还需要你在服务器上另行配置 HTTPS Web 服务器或反向代理，并自行决定访问控制。
+该模式把结果写进服务器本地目录，不需要 `GIST_ID` 或 GitHub Token。`compose.yaml` 里除 `aggregate`（跑流水线）外还有 `web`（Caddy），它只读 `free-nodes/data/published/`，对外提供订阅地址；用真实域名时自动签发 HTTPS 证书。订阅本身不设访问控制——拿到链接的人都能读取，和 Secret Gist 一样，不要把它当成私有链接。
 
-要求：Linux x86-64 或 ARM64 服务器、Docker Engine 和 Docker Compose 插件。仓库根目录原有 `Dockerfile` 保持不变；自托管专用镜像是 `free-nodes/Dockerfile`。
+要求：Linux x86-64 或 ARM64 服务器、Docker Engine 和 Docker Compose 插件、一个指向这台服务器的域名（没有域名时可用 `http://服务器IP:8080` 先测试，但没有 TLS）。仓库根目录原有 `Dockerfile` 保持不变；自托管专用镜像是 `free-nodes/Dockerfile`。
+
+### 一键部署（推荐）
+
+```bash
+git clone https://github.com/cesar699/aggregator.git /opt/aggregator
+cd /opt/aggregator
+cp free-nodes/.env.example free-nodes/.env
+# 编辑 free-nodes/.env，把 DOMAIN 改成你的域名，例如 sub.example.com
+bash free-nodes/deploy-server.sh
+```
+
+脚本会依次：检查 docker/git/flock、拉最新代码、构建镜像、跑一次完整流水线、启动 `web` 服务、装好每 6 小时跑一次的 cron，最后打印订阅地址。已经装过 cron 时不会重复添加。
 
 ```bash
 # 在服务器上克隆仓库；/opt/aggregator 可换成自己的安装目录
@@ -27,27 +39,49 @@ sudo chown -R "$(id -u):$(id -g)" free-nodes/data
 export PUID="$(id -u)" PGID="$(id -g)"
 
 # 构建镜像（包含 Mihomo；Sing-box 版本默认固定为 1.14.3）
-docker compose -f free-nodes/compose.yaml build
+docker compose -f free-nodes/compose.yaml --project-directory free-nodes build
 
 # 手动跑一次完整流程
-docker compose -f free-nodes/compose.yaml run --rm aggregate
+docker compose -f free-nodes/compose.yaml --project-directory free-nodes run --rm aggregate
+
+# 启动订阅 Web 服务（需先在 free-nodes/.env 里填好 DOMAIN）
+docker compose -f free-nodes/compose.yaml --project-directory free-nodes up -d web
 ```
 
 首次成功后，四个文件位于 `free-nodes/data/published/`：`clash.yaml`、`v2ray.txt`、`singbox.json` 和 `report.json`。`published` 是指向版本化完整发布目录的符号链接；每次通过数量门槛后才原子切换，出错或新节点过少时，旧订阅保持不变。历史版本保存在旁边的 `published.releases/` 目录。`free-nodes/data/` 已加入 Git 和 Docker 忽略规则，避免误提交或把运行数据带入镜像构建上下文。
+
+### 对外提供订阅（Caddy 自动 HTTPS）
+
+`web` 服务用 Caddy 2（`caddy:2-alpine`）只读挂载 `free-nodes/data/published/`，配置在 `free-nodes/Caddyfile`，域名从 `free-nodes/.env` 的 `DOMAIN` 读取：
+
+```bash
+# 启动 / 重启 web 服务（aggregate 仍由 cron 或手动 run --rm 触发）
+docker compose -f free-nodes/compose.yaml --project-directory free-nodes up -d web
+docker compose -f free-nodes/compose.yaml --project-directory free-nodes logs web
+
+# DOMAIN=sub.example.com 时的订阅地址
+#   https://sub.example.com/clash.yaml
+#   https://sub.example.com/v2ray.txt
+#   https://sub.example.com/singbox.json
+#   https://sub.example.com/report.json
+# 健康检查：curl -s https://sub.example.com/healthz  （应返回 ok）
+```
+
+注意：Caddy 自动签发证书需要域名已解析到这台服务器，且 80/443 端口能从公网访问；首次签发前订阅会暂时不可用。用 `DOMAIN=http://服务器IP:8080` 时只提供明文 HTTP（8080 端口），仅适合测试，不要长期这样公开订阅。订阅文件响应头为 `Cache-Control: no-cache`，客户端每次都会重新拉取；`web` 服务不做目录列表，只能按文件名访问上述四个文件和 `/healthz`。
 
 ### 每六小时自动运行
 
 在服务器当前用户的 crontab（`crontab -e`）中增加一行。把仓库路径、用户 UID/GID、`docker`/`flock` 路径和日志路径换成服务器上的实际值；常见 UID/GID 是 1000，但请以 `id -u`、`id -g` 为准：
 
 ```cron
-17 */6 * * * cd /opt/aggregator && PUID=1000 PGID=1000 /usr/bin/flock -n /tmp/csmp-free-nodes.lock /usr/bin/docker compose -f free-nodes/compose.yaml run --rm aggregate >> /home/youruser/csmp-free-nodes.log 2>&1
+17 */6 * * * cd /opt/aggregator && PUID=1000 PGID=1000 /usr/bin/flock -n /tmp/csmp-free-nodes.lock /usr/bin/docker compose -f free-nodes/compose.yaml --project-directory free-nodes run --rm aggregate >> /home/youruser/csmp-free-nodes.log 2>&1
 ```
 
-用 `command -v docker` 和 `command -v flock` 查找可执行文件路径。此 cron 时间按服务器本地时区解释；`flock` 可避免上一次慢任务未结束时 cron 再启动一份。手动更新仍可重复执行上面的 `docker compose ... run --rm aggregate` 命令。升级代码后先 `git pull`，再运行 `docker compose -f free-nodes/compose.yaml build`。
+用 `command -v docker` 和 `command -v flock` 查找可执行文件路径。此 cron 时间按服务器本地时区解释；`flock` 可避免上一次慢任务未结束时 cron 再启动一份。`--project-directory free-nodes` 让 Compose 一定从 `free-nodes/.env` 读 `DOMAIN`/`PUID`/`PGID`，并把 `./data` 解析到 `free-nodes/data`。手动更新仍可重复执行上面的 `docker compose ... run --rm aggregate` 命令。升级代码后先 `git pull`，再运行 `docker compose -f free-nodes/compose.yaml --project-directory free-nodes build`，`web` 服务不需要重建（除非改了 `Caddyfile`，改后执行 `up -d web` 即可）。
 
-Docker 容器以非 root UID/GID 运行、只读根文件系统、丢弃 Linux capabilities，并且不映射端口。数据只写入 `free-nodes/data` 挂载卷。首次构建需要联网下载固定版本的 Sing-box 发布包；需更新该版本时，在 `free-nodes/Dockerfile` 中改 `SINGBOX_VERSION`，并与 GitHub Actions 工作流中的版本保持一致。
+Docker 容器以非 root UID/GID 运行、只读根文件系统、丢弃 Linux capabilities。`aggregate` 不映射端口；只有 `web` 对外开放 80/443（以及测试用的 8080）。数据只写入 `free-nodes/data` 挂载卷。首次构建需要联网下载固定版本的 Sing-box 发布包；需更新该版本时，在 `free-nodes/Dockerfile` 中改 `SINGBOX_VERSION`，并与 GitHub Actions 工作流中的版本保持一致。
 
-> 自托管当前只负责运行任务和生成本地文件，不会自动创建公网订阅地址或 HTTPS。不要直接把无访问控制的目录暴露给公网；如需外部客户端订阅，请在自己的 HTTPS 反向代理上映射 `free-nodes/data/published/`，再把对应地址导入客户端。
+> 服务器模式和 GitHub Actions 模式互相独立、可以同时开着，但两者发布的是各自跑出来的结果，节点数可能不同；`web` 服务只提供服务器本地 `free-nodes/data/published/` 的内容，不会去读 Gist。
 
 ## 节点源与检查规则
 

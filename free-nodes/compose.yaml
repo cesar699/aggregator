@@ -29,3 +29,27 @@ services:
       - /data/run
       - --publish-dir
       - /data/published
+
+  # Serves free-nodes/data/published as public subscription URLs.
+  # DOMAIN comes from free-nodes/.env (see .env.example). A real domain
+  # gets automatic HTTPS; use http://IP:8080 for a plain-HTTP test.
+  # This service only reads the published directory; it never runs the
+  # pipeline. Start it with: docker compose up -d web
+  web:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: "${DOMAIN:?set DOMAIN in free-nodes/.env (see .env.example)}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/published:/srv:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
