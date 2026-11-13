@@ -2,7 +2,7 @@ name: Free Nodes
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "17 */6 * * *"
   workflow_dispatch:
 
 # The failure-alert step creates issues; without this the default token
@@ -38,18 +38,19 @@ jobs:
       - name: Make Mihomo executable
         run: chmod +x clash/clash-linux-amd
 
+      - name: Download sing-box
+        run: |
+          curl --fail -sSL -o /tmp/sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          /tmp/sing-box-1.14.3-linux-amd64/sing-box version
+
       - name: Run aggregation pipeline
         env:
           GIST_PAT: ${{ secrets.GIST_PAT }}
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
+          SINGBOX_BIN: /tmp/sing-box-1.14.3-linux-amd64/sing-box
         run: python free-nodes/run.py --out out
-
-      - name: Download sing-box
-        run: |
-          curl -sL -o /tmp/sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz
-          tar -xzf /tmp/sing-box.tar.gz -C /tmp
-          /tmp/sing-box-1.14.3-linux-amd64/sing-box version
 
       - name: Validate outputs
         run: python free-nodes/validate.py --dir out --mihomo-bin clash/clash-linux-amd --singbox-bin /tmp/sing-box-1.14.3-linux-amd64/sing-box

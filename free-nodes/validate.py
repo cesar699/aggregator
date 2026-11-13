@@ -13,6 +13,7 @@ Checks (first problem found exits non-zero):
 """
 import argparse
 import base64
+import ipaddress
 import json
 import subprocess
 import sys
@@ -93,6 +94,13 @@ def validate_dir(out_dir: Path, mihomo_bin=None, singbox_bin=None) -> int:
     outbounds = singbox.get("outbounds") if isinstance(singbox, dict) else None
     if not isinstance(outbounds, list) or len(outbounds) == 0:
         return fail("singbox.json has no outbounds")
+    proxy_outbounds = [o for o in outbounds if isinstance(o, dict) and o.get("type") != "selector"]
+    selectors = [o for o in outbounds if isinstance(o, dict) and o.get("type") == "selector"]
+    if len(proxy_outbounds) != len(proxies):
+        return fail(f"singbox.json proxy outbounds ({len(proxy_outbounds)}) != Clash proxies ({len(proxies)})")
+    route = singbox.get("route")
+    if not isinstance(route, dict) or len(selectors) != 1 or route.get("final") != selectors[0].get("tag"):
+        return fail("singbox.json must have exactly one selector matching route.final")
 
     # --- v2ray.txt ---
     raw = v2ray_path.read_text(encoding="utf-8").strip()
@@ -100,7 +108,7 @@ def validate_dir(out_dir: Path, mihomo_bin=None, singbox_bin=None) -> int:
         return fail("v2ray.txt is empty")
     try:
         padded = raw + "=" * (-len(raw) % 4)
-        decoded = base64.b64decode(padded, validate=False).decode("utf-8")
+        decoded = base64.b64decode(padded, validate=True).decode("utf-8")
     except Exception as e:
         return fail(f"v2ray.txt is not valid base64: {e}")
     lines = [ln.strip() for ln in decoded.splitlines() if ln.strip()]
@@ -108,7 +116,16 @@ def validate_dir(out_dir: Path, mihomo_bin=None, singbox_bin=None) -> int:
         return fail("v2ray.txt decodes to no links")
     for ln in lines:
         if not ln.startswith(KNOWN_SCHEMES):
-            return fail(f"v2ray.txt contains unknown-scheme link: {ln[:80]!r}")
+            return fail("v2ray.txt contains an unknown-scheme link")
+    try:
+        from run import parse_link
+    except Exception as e:
+        return fail(f"V2Ray share-link parser unavailable: {type(e).__name__}")
+    for i, ln in enumerate(lines, 1):
+        try:
+            parse_link(ln)
+        except Exception as e:
+            return fail(f"V2Ray link #{i} is invalid ({type(e).__name__})")
 
     # --- report.json ---
     try:
@@ -118,9 +135,66 @@ def validate_dir(out_dir: Path, mihomo_bin=None, singbox_bin=None) -> int:
     kept = (report.get("counts") or {}).get("kept")
     if not isinstance(kept, int) or kept < 1:
         return fail(f"report.json kept < 1 (kept={kept!r})")
+    if kept > 200:
+        return fail(f"report.json kept exceeds the 200-node limit (kept={kept})")
     nodes = report.get("nodes") or []
     if len(nodes) != kept:
         return fail(f"report.json nodes ({len(nodes)}) != kept ({kept})")
+    if len(proxies) != kept or len(lines) != kept or len(proxy_outbounds) != kept:
+        return fail("Clash, V2Ray, Sing-box and report node counts do not match")
+    enrichment = report.get("enrichment") or {}
+    reputation = enrichment.get("ip_reputation") if isinstance(enrichment, dict) else None
+    blacklist = enrichment.get("blacklist") if isinstance(enrichment, dict) else None
+    if not isinstance(reputation, dict) or reputation.get("provider") != "IPQuery" or not str(reputation.get("url", "")).startswith("https://"):
+        return fail("report.json is missing the IPQuery reputation source")
+    if not isinstance(blacklist, dict) or not str(blacklist.get("url", "")).startswith("https://"):
+        return fail("report.json is missing the public blacklist source")
+    if not isinstance(blacklist.get("entries"), int) or blacklist["entries"] < 1:
+        return fail("report.json blacklist snapshot has no valid entries")
+    if not isinstance(blacklist.get("checked_at"), str) or not blacklist["checked_at"]:
+        return fail("report.json blacklist snapshot is missing checked_at")
+    if blacklist.get("reporting_window_hours") != 48:
+        return fail("report.json blacklist reporting window is not 48 hours")
+    ip_versions = blacklist.get("ip_versions")
+    if not isinstance(ip_versions, list) or not ip_versions or any(v not in (4, 6) for v in ip_versions):
+        return fail("report.json blacklist snapshot has invalid IP-version coverage")
+    latencies = []
+    for i, node in enumerate(nodes, 1):
+        if not isinstance(node, dict):
+            return fail(f"report node #{i} is not an object")
+        required_fields = ("country", "asn", "network_type", "proxy_flag", "vpn_flag", "tor_flag",
+                           "public_risk_flag", "risk_score", "blacklist_flag", "blacklist_status",
+                           "blacklist_source", "blacklist_checked_at", "netflix", "chatgpt")
+        if any(field not in node for field in required_fields):
+            return fail(f"report node #{i} is missing required purity fields")
+        try:
+            address = ipaddress.ip_address(str(node.get("exit_ip", "")))
+        except ValueError:
+            return fail(f"report node #{i} has an invalid exit IP")
+        if not address.is_global:
+            return fail(f"report node #{i} exit IP is not public")
+        if address.version not in ip_versions:
+            return fail(f"blacklist snapshot does not cover report node #{i} IP version")
+        for field in ("proxy_flag", "vpn_flag", "tor_flag", "public_risk_flag", "blacklist_flag"):
+            if type(node.get(field)) is not bool:
+                return fail(f"report node #{i} field {field} is not a boolean result")
+        if not isinstance(node.get("risk_score"), int) or isinstance(node["risk_score"], bool) or not 0 <= node["risk_score"] <= 100:
+            return fail(f"report node #{i} has an invalid IPQuery risk_score")
+        expected_status = "match" if node["blacklist_flag"] else "no_match"
+        if node["blacklist_status"] != expected_status:
+            return fail(f"report node #{i} blacklist flag/status disagree")
+        if node["blacklist_source"] != blacklist.get("name") or node["blacklist_checked_at"] != blacklist["checked_at"]:
+            return fail(f"report node #{i} blacklist metadata does not match the checked snapshot")
+        if node.get("network_type") not in ("datacenter", "mobile", "likely-residential", "unknown"):
+            return fail(f"report node #{i} has an unknown network_type")
+        if node.get("netflix") not in ("yes", "no", "unknown") or node.get("chatgpt") not in ("yes", "no", "unknown"):
+            return fail(f"report node #{i} has invalid unlock-probe results")
+        latency = node.get("latency_ms")
+        if not isinstance(latency, int) or latency < 0 or latency > 5000:
+            return fail(f"report node #{i} latency is missing or over 5000 ms")
+        latencies.append(latency)
+    if latencies != sorted(latencies):
+        return fail("report nodes are not sorted by latency")
 
     print(
         f"VALIDATE OK: clash={len(proxies)} proxies, "

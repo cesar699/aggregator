@@ -1,44 +1,32 @@
-# 部署步骤（首次手动设置，约 5 分钟）
+# 部署与更新
 
-> 以下步骤需要你本人在浏览器里完成，涉及 Token 创建，助手不代操作。**Token 只放仓库 Secrets，绝不写进代码、绝不公开。**
+当前 Fork 已配置 Free Nodes 工作流，并已有一个 Secret Gist 用于保存订阅及报告；无需再创建重复 Gist。**Secret Gist 是不公开链接，不是访问控制；任何拿到订阅 URL 的人都能读取内容。**免费节点来源不可信，不要用它登录账号、支付或传输敏感信息。
 
-## 1. 创建一个 Secret Gist（放订阅文件）
+## 必需的仓库 Secrets
 
-1. 打开 https://gist.github.com/ ，登录 GitHub 账号 `cesar699`。
-2. 新建 Gist，**选 Secret（不公开）**。
-3. 先建 4 个占位文件，文件名必须 exactly 是：
-   - `clash.yaml`（内容任意，如 `# placeholder`）
-   - `v2ray.txt`
-   - `singbox.json`（内容 `{}`）
-   - `report.json`（内容 `{}`）
-4. 点 **Create secret gist**，记下地址栏里的 Gist ID（一串十六进制字符）。
+在 GitHub 仓库 **Settings → Secrets and variables → Actions** 中确认 `GIST_ID`（现有 Secret Gist 的 ID），以及 `GIST_PAT`（可更新 Gist 的 PAT，建议只授予 `gist` 权限）。如果使用兼容的旧配置，也可用 `PUSH_TOKEN`；脚本先读 `GIST_PAT`，未设置时回退到 `PUSH_TOKEN`。
 
-## 2. 创建一个只含 `gist` 权限的 Classic PAT
+Token 只能放在仓库 Secrets，不能写进代码、README、提交记录或公开日志。轮换时只更新对应 Secret，不要把 Token 发在聊天或代码里。IPQuery 和 blocklist.de 均用公开 HTTPS 数据，不需要额外 API Key。
 
-1. 打开 https://github.com/settings/tokens （Personal access tokens → Tokens (classic)）。
-2. **Generate new token (classic)**，Note 填 `aggregator-gist`。
-3. Expiration 选 **No expiration**（或 90 days，到期需重建）。
-4. **只勾选 `gist`**（Create gists），不要勾其他权限。
-5. 生成后**立即复制 Token，只显示一次**，不要发到聊天记录、不要写进代码。
+## 手动运行与状态
 
-## 3. 把两个值放进仓库 Secrets
+打开仓库 **Actions → Free Nodes → Run workflow → Run workflow** 可立即启动一次检查。成功时，Gist 会一次性更新 `clash.yaml`、`v2ray.txt`、`singbox.json` 和 `report.json`。工作流每 6 小时自动运行一次（UTC 每 6 小时的第 17 分钟）；README 顶部徽章显示最近状态。
 
-1. 打开 https://github.com/cesar699/aggregator/settings/secrets/actions 。
-2. **New repository secret**：
-   - Name `GIST_ID`，Value = 第 1 步的 Gist ID。
-   - Name `GIST_PAT`，Value = 第 2 步的 PAT。
-3. （可选）如果你已有旧的 `PUSH_TOKEN`，也可以继续用——工作流同时读取 `GIST_PAT`，没有时才 fallback 到 `PUSH_TOKEN`。
+## 检查与保护规则
 
-## 4. 开启 Actions 并手动跑一次
+四个订阅源分别抓取，单个节点源失败不会阻断其他源；对 HTTP 403、429 等拒绝或限流响应不重试，所有节点源都没有有效节点时整轮失败。另有一个必需的纯净度数据源：若黑名单快照下载或解析失败，整轮不发布，旧 Gist 保持不变。
 
-1. 打开 https://github.com/cesar699/aggregator/actions ，如果 fork 默认禁用了 Actions，按提示启用。
-2. 左侧选 **Free Nodes** → **Run workflow** → **Run workflow**。
-3. 等待运行完成（约 5–20 分钟，取决于活节点数量和纯净度探测速度）。
-4. 成功后打开 Gist，4 个文件应已更新为真实订阅内容；`report.json` 里有 `generated_at`、`counts` 和每节点的出口信息。
+只有通过 Mihomo 双网址测试的节点才继续检查：Google `generate_204` 与 YouTube 静态图片都必须通，两个延迟均不超过 5000ms。每个候选活节点通过节点出口查询公网 IP；出口 IP 缺失、无效或非公网会剔除。报告还记录国家、ASN、机房/移动/推测住宅分类、IPQuery 的代理/VPN/Tor 标签与风险分数，以及 Netflix/ChatGPT 解锁结果。
 
-## 之后
+`blacklist_flag` 是出口 IP 是否精确命中 [blocklist.de 的 all.txt 名单](https://lists.blocklist.de/lists/all.txt)。官方说明该名单列出过去 48 小时向其或合作方报告的攻击 IP，并每 30 分钟生成；因此“未命中”仅表示未出现在这份近期名单中，不代表全网或所有威胁情报库都判定干净。该结果与 IPQuery 的 proxy/VPN/Tor 分类分开报告，不会因命中而自动删掉节点。
 
-- 每 6 小时自动运行一次，无需干预。
-- 失败时 Gist 保留上一次成功的结果；连续失败 2 次会自动在仓库开 Issue 提醒。
-- 轮换 Token 时只需更新 Secrets 里的 `GIST_PAT`，不用改代码。
-- 订阅链接格式：`https://gist.githubusercontent.com/cesar699/<GIST_ID>/raw/<文件名>`。
+最后按两个测速中较高的延迟排序，最多保留 200 个节点。发布前必须通过 Clash YAML 解析、V2Ray Base64 解码和每条分享链接解析、Sing-box JSON 解析、Mihomo 配置检查与 `sing-box check`。少于 20 个节点，或低于上次保留数的一半（向上取整），旧结果都会保留；旧报告读不到、检查数据缺失或任一验证失败也不会更新。连续失败两次会在 Fork 仓库创建一条 Issue 提醒。
+
+## 订阅地址
+
+当前可用链接列在仓库根目录 README 的“订阅地址”表中。原始格式为：
+
+- `https://gist.githubusercontent.com/cesar699/<GIST_ID>/raw/clash.yaml`
+- `https://gist.githubusercontent.com/cesar699/<GIST_ID>/raw/v2ray.txt`
+- `https://gist.githubusercontent.com/cesar699/<GIST_ID>/raw/singbox.json`
+- `https://gist.githubusercontent.com/cesar699/<GIST_ID>/raw/report.json`

@@ -6,7 +6,7 @@
 
 ## 订阅地址
 
-把下面链接中的 `24c6aea70f95c6f67a5cc66515e90081` 换成实际的 Gist ID（见仓库 Secrets 中的 `GIST_ID`）：
+以下链接对应仓库 Secrets 中的 `GIST_ID`，当前可直接使用。Secret Gist 是“不公开链接”，不是访问控制；拿到链接的人都能读取订阅。
 
 | 格式 | 订阅链接 |
 | --- | --- |
@@ -14,7 +14,7 @@
 | V2Ray | `https://gist.githubusercontent.com/cesar699/24c6aea70f95c6f67a5cc66515e90081/raw/v2ray.txt` |
 | Sing-box | `https://gist.githubusercontent.com/cesar699/24c6aea70f95c6f67a5cc66515e90081/raw/singbox.json` |
 
-纯净度报告（出口国家 / ASN / 机房或住宅 / Netflix、ChatGPT 解锁）：`https://gist.githubusercontent.com/cesar699/24c6aea70f95c6f67a5cc66515e90081/raw/report.json`
+纯净度报告（出口国家 / ASN / 机房、移动或推测住宅 / 代理风险 / 黑名单命中 / Netflix、ChatGPT 解锁）：`https://gist.githubusercontent.com/cesar699/24c6aea70f95c6f67a5cc66515e90081/raw/report.json`。代理/VPN/Tor 分类和风险分数来自 IPQuery；独立 `blacklist_flag` 是对 [blocklist.de 公开名单](https://www.blocklist.de/en/export.html) 的精确 IP 匹配（该名单记录过去 48 小时报告的攻击 IP），不是覆盖所有威胁情报的“绝对干净”结论。
 
 ## 一键导入 Shadowrocket
 
@@ -38,16 +38,16 @@ printf 'https://gist.githubusercontent.com/cesar699/24c6aea70f95c6f67a5cc66515e9
 ![Free Nodes](https://github.com/cesar699/aggregator/actions/workflows/free-nodes.yaml/badge.svg)
 
 - 定时：每 6 小时自动运行（Actions → Free Nodes）
-- 手动更新：Actions → Free Nodes → Run workflow
-- 失败策略：失败时保留上一次的 Gist 结果；新结果少于 20 个节点，或不到上次保留数的一半，也视为失败、不更新 Gist；连续失败 2 次会自动开 Issue 提醒。
+- 手动更新：Actions → Free Nodes → Run workflow → Run workflow；轮换 `GIST_PAT` 时只更新仓库 Secrets，不改代码。
+- 失败策略：失败时保留上一次的 Gist 结果；新结果少于 20 个节点，或低于上次保留数的一半（向上取整），也视为失败、不更新 Gist；连续失败 2 次会自动开 Issue 提醒。
 
 ## 工作方式
 
 1. 抓取 4 个公开节点源（单个源失效不影响其他源；全部失效整轮失败）
 2. 去重（按协议 + 服务器 + 端口 + 身份）；SSR 协议节点直接丢弃
-3. Mihomo 延迟测试：节点同时请求 Google `generate_204` 和一个 YouTube 静态资源，两项都通、延迟 < 5000ms 才算活节点
-4. 对活节点逐个做出口纯净度检查：出口 IP 的国家 / ASN / 机房或住宅 / 代理或黑名单标记，探测 Netflix、ChatGPT 是否解锁；查不到出口 IP 的节点直接剔除
-5. 生成 Clash / V2Ray / Sing-box 三份订阅 + `report.json`，更新到 Gist
+3. Mihomo 延迟测试：节点同时请求 Google `generate_204` 和一个 YouTube 静态资源，两项都通、两项延迟均 ≤ 5000ms 才算活节点
+4. 对活节点逐个做出口检查：出口 IP 必须是有效公网 IP；记录国家 / ASN / 机房、移动或推测住宅分类，IPQuery 代理/VPN/Tor 风险标记与分数、blocklist.de 黑名单匹配，以及 Netflix、ChatGPT 解锁情况
+5. 生成 Clash / V2Ray / Sing-box 三份订阅 + `report.json`；先用 YAML / JSON / Base64 链接解析器、Mihomo 和 Sing-box 校验，再一次性更新 Gist。必需的黑名单快照不可用或格式异常时，本轮不更新 Gist。
 
 详见 [`free-nodes/SETUP.md`](free-nodes/SETUP.md)。
 
