@@ -52,6 +52,7 @@ jobs:
           GIST_PAT: ${{ secrets.GIST_PAT }}
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
           SINGBOX_BIN: /tmp/sing-box-1.14.3-linux-amd64/sing-box
         run: python free-nodes/run.py --out out
 

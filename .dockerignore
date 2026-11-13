@@ -2,3 +2,7 @@
 *.pyc
 .git
 __pycache__
+free-nodes/data/
+free-nodes/out/
+out/
+**/.env

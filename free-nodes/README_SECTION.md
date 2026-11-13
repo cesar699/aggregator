@@ -1,6 +1,6 @@
 # CSMP 免费节点聚合
 
-每 6 小时自动抓取公开免费节点源，去重、Mihomo 双目标延迟检测、出口纯净度探测，只保留活节点，按延迟排序（最多 200 个），订阅保存在 GitHub Secret Gist。
+每 6 小时从六个固定公开免费节点源抓取，并自动搜索 GitHub 最多补充四个候选源；节点经 Mihomo 双目标测速和出口纯净度检查后，最多保留 200 个。GitHub Actions 默认发布到 Secret Gist；也可 Docker 自托管并把结果原子写入本地目录。
 
 > **安全提醒：**免费节点来源不可信，不要用它登录账号、支付或传输敏感信息。Secret Gist 是不公开链接而非访问控制；拿到链接的人都能读取。
 
@@ -35,17 +35,17 @@ printf 'https://gist.githubusercontent.com/cesar699/24c6aea70f95c6f67a5cc66515e9
 
 ![Free Nodes](https://github.com/cesar699/aggregator/actions/workflows/free-nodes.yaml/badge.svg)
 
-- 定时：每 6 小时自动运行（UTC 每 6 小时的第 17 分钟）。
+- 定时：GitHub Actions 每 6 小时自动运行（UTC 每 6 小时的第 17 分钟）；服务器自托管 cron 见部署文档。
 - 手动更新：GitHub 仓库 **Actions → Free Nodes → Run workflow → Run workflow**。
 - 失败保护：少于 20 个节点或低于上次保留数的一半（向上取整）时不更新 Gist；检查或验证失败时保留上次结果，连续失败 2 次开 Issue 提醒。
 - Secrets：`GIST_ID` 与 `GIST_PAT`（或兼容的 `PUSH_TOKEN`）只放在仓库 Actions Secrets，不能写入代码；IPQuery 和 blocklist.de 无需 API Key。
 
 ## 工作方式
 
-1. 抓取四个公开节点源，单个源失效不影响其他源；没有任何源产生有效节点时整轮失败。
+1. 抓取六个固定源，并用 GitHub 搜索最多补充四个候选源；单个源或发现接口失效不影响其他来源，所有订阅源都没有有效节点时整轮失败。
 2. 去重；SSR 与不支持或配置无效的节点不进入测试。
 3. Mihomo 通过 Google `generate_204` 与 YouTube 静态图片做双目标延迟测试，两项都通且均 ≤ 5000ms 才算活节点。
 4. 逐个查询节点出口公网 IP；无效/非公网 IP 直接剔除。记录国家、ASN、机房/移动/推测住宅、IPQuery 代理/VPN/Tor 标记与分数、Netflix/ChatGPT 结果和 blocklist.de 精确名单命中。
-5. 下载并解析黑名单快照；快照不可用或格式异常时不更新 Gist。生成三种订阅与 `report.json` 后，先完成 YAML、JSON、Base64/分享链接、Mihomo 与 Sing-box 校验，再一次性更新 Gist。
+5. 下载并解析黑名单快照；快照不可用或格式异常时不发布。生成三种订阅与 `report.json` 后，先完成 YAML、JSON、Base64/分享链接、Mihomo 与 Sing-box 校验，再更新 Gist 或原子发布到服务器本地。
 
 详见 [`free-nodes/SETUP.md`](free-nodes/SETUP.md)。

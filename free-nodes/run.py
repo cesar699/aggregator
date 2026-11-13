@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Free-nodes aggregation pipeline (fork of wzdnz/aggregator, CSMP edition).
 
-Steps: fetch 4 public sources -> parse to canonical Clash proxy dicts ->
+Steps: fetch 6 public sources independently -> parse to canonical Clash proxy dicts ->
 dedupe -> Mihomo liveness test (google generate_204 + YouTube static, both
-must pass < max_latency_ms) -> per-node exit-IP purity check (ip-api +
+must pass at or below max_latency_ms) -> per-node exit-IP purity check (IPQuery +
 Netflix / ChatGPT unlock probes) -> emit clash.yaml / v2ray.txt /
-singbox.json / report.json -> gate -> PATCH a GitHub Gist.
+singbox.json / report.json -> gate -> publish atomically to a local release or
+PATCH a GitHub Gist.
 
-Exit codes: 0 ok, 2 all sources failed, 3 gate failed (no Gist update),
-4 Gist API failure, 5 output validation failure.
+Exit codes: 0 ok, 2 all sources failed, 3 gate failed (no publication),
+4 publication failure, 5 output validation failure.
 
 Env: GIST_PAT (fallback PUSH_TOKEN), GIST_ID. Tokens are never printed.
 Stdlib + PyYAML + requests only.
@@ -19,10 +20,12 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import tempfile
 import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -527,12 +530,15 @@ def clash_to_singbox(d):
 
 # ------------------------------------------------------------- fetch + parse
 
-def fetch_source(url, timeout=30):
+def fetch_source(url, timeout=30, allow_redirects=True):
     last = None
     for attempt in range(2):  # 1 retry
         try:
             r = requests.get(url, timeout=timeout,
-                             headers={"User-Agent": "cesar699-aggregator/1.0"})
+                             headers={"User-Agent": "cesar699-aggregator/1.0"},
+                             allow_redirects=allow_redirects)
+            if not allow_redirects and r.is_redirect:
+                raise RuntimeError("redirects are disabled for discovered sources")
             r.raise_for_status()
             # Decode as UTF-8 explicitly: requests defaults to latin-1 when
             # the server sends no charset, which turns flag emoji bytes into
@@ -633,7 +639,212 @@ def normalise_clash_dict(p):
     return d
 
 
-def collect_sources(cfg, sources_file=None):
+def _repo_identity(url):
+    """Return owner/repo for common GitHub source URL forms."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        parts = [p for p in parsed.path.split("/") if p]
+        host = (parsed.hostname or "").lower()
+        if host == "raw.githubusercontent.com" and len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}".casefold()
+        if host == "github.com" and len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}".casefold()
+        if host.endswith(".github.io"):
+            owner = host[:-len(".github.io")]
+            repo = parts[0] if parts else f"{owner}.github.io"
+            return f"{owner}/{repo}".casefold()
+    except Exception:
+        pass
+    return None
+
+
+def _discovery_feed_kind(path):
+    """Recognise only high-signal subscription filenames in repository trees."""
+    parts = path.casefold().split("/")
+    if any(part in {".github", "archive", "archives", "backup", "backups",
+                    "example", "examples", "template", "templates", "test", "tests"}
+           for part in parts[:-1]):
+        return None
+    basename = parts[-1]
+    if basename in {"clash.yaml", "clash.yml", "nodes.yaml", "nodes.yml"}:
+        return "clash"
+    if basename in {"v2ray.txt", "nodes.txt", "sub.txt"}:
+        return "links"
+    return None
+
+
+def discover_sources(cfg, token=None):
+    """Find a few recent public GitHub subscription feeds, without trusting them.
+
+    Discovery is deliberately bounded: one repository-search request, at most
+    eight tree requests, and at most four new feeds. API failures (especially
+    403/429) are recorded and never retried; configured sources remain usable.
+    """
+    options = cfg.get("source_discovery") or {}
+    enabled = options.get("enabled", False) is True
+    report = {
+        "enabled": enabled,
+        "provider": "GitHub REST API repository search",
+        "query": options.get("query", "free-nodes in:name,description,readme"),
+        "checked_at": datetime.now(CST).isoformat(),
+        "authenticated": bool(token or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")),
+        "status": "disabled" if not enabled else "ok",
+        "api_requests": 0,
+        "repositories_total": 0,
+        "repositories_inspected": 0,
+        "candidate_sources": [],
+        "error": None,
+    }
+    if not enabled:
+        return [], report
+
+    token = token or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "cesar699-aggregator-source-discovery/1.0",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    api_root = options.get("api_url", "https://api.github.com")
+    api_root = api_root.rstrip("/")
+    timeout = min(max(int(options.get("timeout_s", 12)), 3), 30)
+    max_repositories = min(max(int(options.get("max_repositories", 8)), 1), 8)
+    max_sources = min(max(int(options.get("max_sources", 4)), 1), 4)
+    max_file_bytes = min(max(int(options.get("max_file_bytes", 2_000_000)), 1024), 5_000_000)
+    max_tree_bytes = min(max(int(options.get("max_tree_bytes", 4_000_000)), 100_000), 10_000_000)
+    max_age_days = min(max(int(options.get("max_age_days", 180)), 1), 365)
+
+    def api_failure(response=None, detail=None):
+        if response is not None:
+            status = response.status_code
+            if status in (403, 429):
+                return f"GitHub API HTTP {status}; stopped without retry (rate limit or access denied)"
+            return f"GitHub API HTTP {status}"
+        return f"GitHub API request failed: {type(detail).__name__}"
+
+    try:
+        response = requests.get(
+            f"{api_root}/search/repositories",
+            params={"q": report["query"], "sort": "updated", "order": "desc",
+                    "per_page": 20},
+            headers=headers, timeout=timeout)
+        report["api_requests"] += 1
+    except Exception as e:
+        report["status"] = "unavailable"
+        report["error"] = api_failure(detail=e)
+        log(f"source discovery unavailable ({report['error']})")
+        return [], report
+    if response.status_code != 200:
+        report["status"] = "unavailable"
+        report["error"] = api_failure(response=response)
+        log(f"source discovery unavailable ({report['error']})")
+        return [], report
+    try:
+        result = response.json()
+        repositories = result.get("items")
+        if not isinstance(repositories, list):
+            raise ValueError("search response has no items list")
+        report["repositories_total"] = int(result.get("total_count", len(repositories)))
+    except Exception as e:
+        report["status"] = "unavailable"
+        report["error"] = f"invalid GitHub search response: {type(e).__name__}"
+        log(f"source discovery unavailable ({report['error']})")
+        return [], report
+
+    excluded = {_repo_identity(src.get("url", "")) for src in cfg.get("sources", [])}
+    excluded.update(str(repo).casefold() for repo in options.get("exclude_repositories", []))
+    existing_urls = {str(src.get("url", "")).casefold() for src in cfg.get("sources", [])}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    found = []
+    for repo in repositories:
+        if len(found) >= max_sources or report["repositories_inspected"] >= max_repositories:
+            break
+        if not isinstance(repo, dict) or repo.get("archived") or repo.get("fork"):
+            continue
+        full_name = str(repo.get("full_name") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", full_name):
+            continue
+        if full_name.casefold() in excluded:
+            continue
+        try:
+            updated_at = datetime.fromisoformat(str(repo.get("updated_at", "")).replace("Z", "+00:00"))
+            if updated_at.tzinfo is None or updated_at < cutoff:
+                continue
+        except (TypeError, ValueError):
+            continue
+        branch = str(repo.get("default_branch") or "")
+        if not branch or len(branch) > 200:
+            continue
+
+        report["repositories_inspected"] += 1
+        tree_url = (f"{api_root}/repos/{urllib.parse.quote(full_name, safe='/')}"
+                    f"/git/trees/{urllib.parse.quote(branch, safe='')}" )
+        try:
+            tree_response = requests.get(
+                tree_url, params={"recursive": "1"}, headers=headers, timeout=timeout)
+            report["api_requests"] += 1
+        except Exception as e:
+            report["status"] = "partial" if found else "unavailable"
+            report["error"] = api_failure(detail=e)
+            break
+        if tree_response.status_code in (403, 429):
+            report["status"] = "partial" if found else "unavailable"
+            report["error"] = api_failure(response=tree_response)
+            break
+        if tree_response.status_code == 404:
+            continue
+        if tree_response.status_code != 200:
+            report["status"] = "partial" if found else "unavailable"
+            report["error"] = api_failure(response=tree_response)
+            break
+        if len(tree_response.content) > max_tree_bytes:
+            continue
+        try:
+            tree_data = tree_response.json()
+            entries = tree_data.get("tree")
+            if not isinstance(entries, list):
+                continue
+        except Exception:
+            continue
+
+        candidates = []
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("type") != "blob":
+                continue
+            path = entry.get("path")
+            size = entry.get("size")
+            if not isinstance(path, str) or not isinstance(size, int) or size > max_file_bytes:
+                continue
+            kind = _discovery_feed_kind(path)
+            if kind:
+                candidates.append((0 if kind == "clash" else 1, path, kind))
+        for _priority, path, kind in sorted(candidates):
+            owner, repository = full_name.split("/", 1)
+            raw_url = (
+                "https://raw.githubusercontent.com/"
+                f"{urllib.parse.quote(owner, safe='')}/{urllib.parse.quote(repository, safe='')}/"
+                f"{urllib.parse.quote(branch, safe='')}/{urllib.parse.quote(path, safe='/')}"
+            )
+            if raw_url.casefold() in existing_urls:
+                continue
+            name = f"auto:{full_name}:{path}"
+            found.append({"name": name, "kind": kind, "url": raw_url,
+                          "discovered": True, "repository": full_name, "path": path})
+            existing_urls.add(raw_url.casefold())
+            break  # at most one feed per repository
+
+    report["candidate_sources"] = [
+        {"name": src["name"], "repository": src["repository"],
+         "path": src["path"], "url": src["url"]} for src in found]
+    if report["status"] == "ok":
+        report["status"] = "ok" if found else "no_candidates"
+    log(f"source discovery {report['status']}: candidates={len(found)} "
+        f"repos_inspected={report['repositories_inspected']} api_requests={report['api_requests']}")
+    return found, report
+
+
+def collect_sources(cfg, sources_file=None, extra_sources=None):
     """Return (proxies, source_reports, counters). Single-source failure
     never fails the run; all failing -> caller exits 2."""
     local_map = None
@@ -641,14 +852,16 @@ def collect_sources(cfg, sources_file=None):
         local_map = json.loads(Path(sources_file).read_text(encoding="utf-8"))
     proxies, reports = [], []
     counters = {"raw": 0, "dropped_ssr": 0, "dropped_unknown": 0, "dropped_bad": 0}
-    for src in cfg["sources"]:
+    for src in [*cfg["sources"], *(extra_sources or [])]:
         url, kind = src["url"], src.get("kind", "links")
-        rep = {"url": url, "fetched": False, "count": 0, "error": None}
+        rep = {"name": src.get("name", url), "url": url,
+               "fetched": False, "count": 0, "error": None,
+               "source_type": "discovered" if src.get("discovered") else "configured"}
         try:
             if local_map is not None and url in local_map:
                 text = Path(local_map[url]).read_text(encoding="utf-8")
             else:
-                text = fetch_source(url)
+                text = fetch_source(url, allow_redirects=not src.get("discovered"))
             rep["fetched"] = True
         except Exception as e:
             rep["error"] = str(e)[:200]
@@ -1076,7 +1289,8 @@ def purity_check(mihomo, kept, cfg, blacklist_ips=None, blacklist_meta=None):
 
 # ------------------------------------------------------------------ outputs
 
-def build_outputs(proxies_sorted, nodes, out_dir, cfg, source_reports, counts, gate, enrichment=None):
+def build_outputs(proxies_sorted, nodes, out_dir, cfg, source_reports, counts, gate,
+                  enrichment=None, source_discovery=None):
     """proxies_sorted: [(proxy, latency)] in final order (== nodes order).
     nodes: purity report rows (same order)."""
     out_dir = Path(out_dir)
@@ -1127,6 +1341,7 @@ def build_outputs(proxies_sorted, nodes, out_dir, cfg, source_reports, counts, g
     report = {
         "generated_at": datetime.now(CST).isoformat(),
         "sources": source_reports,
+        "source_discovery": source_discovery or {"enabled": False, "status": "not_configured"},
         "enrichment": enrichment or {},
         "counts": counts,
         "gate": gate,
@@ -1137,7 +1352,7 @@ def build_outputs(proxies_sorted, nodes, out_dir, cfg, source_reports, counts, g
     return report
 
 
-# --------------------------------------------------------------------- gist
+# ------------------------------------------------------------------ publish
 
 def gist_update(out_dir, cfg):
     """Gate + single PATCH. Returns exit code (0 ok, 3 gate, 4 api fail)."""
@@ -1216,6 +1431,95 @@ def gist_update(out_dir, cfg):
     return 0
 
 
+def local_update(out_dir, publish_dir, cfg):
+    """Gate and atomically publish a complete local release directory.
+
+    ``publish_dir`` is a managed symlink to a versioned sibling directory.
+    The previous release remains untouched on validation, gate, or I/O failure.
+    """
+    out_dir = Path(out_dir)
+    publish_dir = Path(publish_dir)
+    release_root = publish_dir.parent / f"{publish_dir.name}.releases"
+    staging = None
+    release_path = None
+    temp_link = None
+    try:
+        if release_root.is_symlink():
+            raise ValueError("managed releases path must not be a symlink")
+        report_path = out_dir / "report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        counts = report.get("counts")
+        kept = counts.get("kept") if isinstance(counts, dict) else None
+        if not isinstance(kept, int) or isinstance(kept, bool) or kept < 1:
+            raise ValueError("new report has invalid counts.kept")
+
+        prev_kept = None
+        if publish_dir.is_symlink():
+            current = publish_dir.resolve(strict=True)
+            managed_root = release_root.resolve(strict=True)
+            if not current.is_relative_to(managed_root) or not current.is_dir():
+                raise ValueError("existing publish symlink is outside the managed releases directory")
+            previous_path = current / "report.json"
+            if not previous_path.is_file():
+                raise ValueError("previous local release has no report.json")
+            previous_report = json.loads(previous_path.read_text(encoding="utf-8"))
+            previous_counts = previous_report.get("counts")
+            prev_kept = previous_counts.get("kept") if isinstance(previous_counts, dict) else None
+            if not isinstance(prev_kept, int) or isinstance(prev_kept, bool) or prev_kept < 1:
+                raise ValueError("previous local report has invalid counts.kept")
+        elif publish_dir.exists():
+            raise ValueError("publish path exists but is not a managed symlink; move it aside before first local publish")
+
+        half_previous = (prev_kept + 1) // 2 if prev_kept is not None else 0
+        min_required = max(cfg["min_keep"], half_previous)
+        passed = kept >= min_required
+        report["gate"] = {"prev_kept": prev_kept, "min_required": min_required,
+                          "passed": passed}
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        if not passed:
+            log(f"GATE FAIL: kept={kept} prev_kept={prev_kept} min_required={min_required} -> local output NOT updated")
+            return 3
+
+        filenames = cfg["gist_filenames"]
+        missing = [name for name in filenames if not (out_dir / name).is_file()]
+        if missing:
+            raise ValueError(f"new local release is missing files: {missing}")
+        publish_dir.parent.mkdir(parents=True, exist_ok=True)
+        if release_root.is_symlink():
+            raise ValueError("managed releases path must not be a symlink")
+        release_root.mkdir(parents=True, exist_ok=True)
+        if not release_root.resolve().is_relative_to(publish_dir.parent.resolve()):
+            raise ValueError("managed releases path resolves outside its parent")
+
+        staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=release_root))
+        for name in filenames:
+            shutil.copy2(out_dir / name, staging / name)
+        release_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+        release_path = release_root / release_id
+        os.replace(staging, release_path)
+        staging = None
+
+        temp_link = publish_dir.parent / f".{publish_dir.name}.link-{uuid.uuid4().hex}"
+        os.symlink(os.path.relpath(release_path, publish_dir.parent), temp_link)
+        os.replace(temp_link, publish_dir)
+        temp_link = None
+        release_path = None  # the active symlink now owns this release
+        log(f"LOCAL OK: published {kept} nodes to {publish_dir}")
+        return 0
+    except Exception as e:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        if temp_link is not None:
+            try:
+                temp_link.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if release_path is not None and release_path.exists():
+            shutil.rmtree(release_path, ignore_errors=True)
+        log(f"LOCAL FAIL: output NOT published ({type(e).__name__}: {e})")
+        return 4
+
+
 # ---------------------------------------------------------------------- main
 
 def main():
@@ -1224,12 +1528,38 @@ def main():
     ap.add_argument("--skip-mihomo", action="store_true")
     ap.add_argument("--skip-purity", action="store_true")
     ap.add_argument("--out", default="out")
+    ap.add_argument("--publish", choices=("gist", "local"), default="gist",
+                    help="publish to the configured GitHub Gist (default) or a local release directory")
+    ap.add_argument("--publish-dir", default="published",
+                    help="managed local publish symlink path used with --publish local")
     ap.add_argument("--sources-file", default=None,
                     help="JSON mapping source URL -> local file (offline testing)")
     args = ap.parse_args()
 
     cfg = load_config()
-    proxies, reports, counters = collect_sources(cfg, args.sources_file)
+    if args.sources_file:
+        discovered_sources = []
+        discovery_report = {
+            "enabled": False, "provider": "GitHub REST API repository search",
+            "status": "skipped_offline_test_mode", "api_requests": 0,
+            "repositories_total": 0, "repositories_inspected": 0,
+            "candidate_sources": [], "error": None,
+        }
+    else:
+        try:
+            discovered_sources, discovery_report = discover_sources(cfg)
+        except Exception as e:
+            discovered_sources = []
+            discovery_report = {
+                "enabled": bool((cfg.get("source_discovery") or {}).get("enabled")),
+                "provider": "GitHub REST API repository search",
+                "status": "unavailable", "api_requests": 0,
+                "repositories_total": 0, "repositories_inspected": 0,
+                "candidate_sources": [],
+                "error": f"discovery setup failed: {type(e).__name__}",
+            }
+            log(f"source discovery unavailable ({discovery_report['error']}); continuing with configured sources")
+    proxies, reports, counters = collect_sources(cfg, args.sources_file, discovered_sources)
     if not any(r["fetched"] for r in reports):
         log("FATAL: all sources failed")
         return 2
@@ -1324,7 +1654,8 @@ def main():
         "ip_reputation": {"provider": "IPQuery", "url": cfg["exit_ip_url"]},
         "blacklist": blacklist_meta,
     }
-    build_outputs(kept, nodes, args.out, cfg, reports, counts, gate, enrichment)
+    build_outputs(kept, nodes, args.out, cfg, reports, counts, gate, enrichment,
+                  discovery_report)
 
     # internal validation
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1340,7 +1671,7 @@ def main():
         log(f"FATAL: required output validator not importable: {e}")
         return 5
 
-    rc = gist_update(args.out, cfg)
+    rc = gist_update(args.out, cfg) if args.publish == "gist" else local_update(args.out, args.publish_dir, cfg)
     log(f"SUMMARY: raw={counts['raw']} deduped={counts['deduped']} "
         f"alive={counts['alive']} kept={counts['kept']} "
         f"dropped_purity_check={dropped_purity_check} "

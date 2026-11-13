@@ -134,3 +134,6 @@ config.yaml
 generate.ini
 subscribe/config/config.json
 config.local.json
+free-nodes/data/
+free-nodes/out/
+out/

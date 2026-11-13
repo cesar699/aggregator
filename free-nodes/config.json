@@ -23,22 +23,46 @@
   "probe_timeout_s": 6,
   "sources": [
     {
+      "name": "v2raydog-v2ray",
       "kind": "links",
       "url": "https://raw.githubusercontent.com/v2raydog-node/free-nodes/main/v2ray.txt"
     },
     {
+      "name": "v2raydog-clash",
       "kind": "clash",
       "url": "https://raw.githubusercontent.com/v2raydog-node/free-nodes/main/clash.yaml"
     },
     {
+      "name": "node-sub-zixf-v2ray",
       "kind": "links",
       "url": "https://raw.githubusercontent.com/chenzhihan1751-cyber/node-sub-zixf/main/sub/v2ray.txt"
     },
     {
+      "name": "735754647-free-nodes",
       "kind": "clash",
       "url": "https://735754647.github.io/Free-Nodes/clash.yaml"
+    },
+    {
+      "name": "0xRadikal-verified-clash",
+      "kind": "clash",
+      "url": "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/verified/clash.yaml"
+    },
+    {
+      "name": "Au1rxx-clash",
+      "kind": "clash",
+      "url": "https://raw.githubusercontent.com/Au1rxx/free-vpn-subscriptions/main/output/clash.yaml"
     }
   ],
+  "source_discovery": {
+    "enabled": true,
+    "query": "free-nodes in:name,description,readme",
+    "max_repositories": 8,
+    "max_sources": 4,
+    "max_age_days": 180,
+    "max_file_bytes": 2000000,
+    "max_tree_bytes": 4000000,
+    "timeout_s": 12
+  },
   "test_urls": {
     "google_204": "https://www.google.com/generate_204",
     "youtube_static": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"

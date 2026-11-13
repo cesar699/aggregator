@@ -1,0 +1,31 @@
+name: csmp-free-nodes
+
+services:
+  aggregate:
+    build:
+      context: ..
+      dockerfile: free-nodes/Dockerfile
+    image: csmp-free-nodes:local
+    init: true
+    user: "${PUID:-1000}:${PGID:-1000}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      MIHOMO_BIN: /usr/local/bin/mihomo
+      SINGBOX_BIN: /usr/local/bin/sing-box
+    volumes:
+      - ./data:/data
+    command:
+      - python
+      - free-nodes/run.py
+      - --publish
+      - local
+      - --out
+      - /data/run
+      - --publish-dir
+      - /data/published
