@@ -122,6 +122,17 @@ venv.bak/
 # mkdocs documentation
 /site
 
+!/site/
+/site/*
+!/site/index.html
+!/site/404.html
+!/site/robots.txt
+!/site/favicon.svg
+!/site/assets/
+/site/assets/*
+!/site/assets/site.css
+!/site/assets/site.js
+
 # mypy
 .mypy_cache/
 .dmypy.json
